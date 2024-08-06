@@ -12,6 +12,7 @@ from ..utils import (
     get_element_html_by_id,
     int_or_none,
     lowercase_escape,
+    traverse_obj,
     try_get,
     update_url_query,
 )
@@ -166,6 +167,10 @@ class GoogleDriveIE(InfoExtractor):
 
     def _real_extract(self, url):
         video_id = self._match_id(url)
+        _, webpage_urlh = self._download_webpage_handle(url, video_id)
+        if webpage_urlh.url != url:
+            return self.url_result(webpage_urlh.url)
+
         video_info = urllib.parse.parse_qs(self._download_webpage(
             'https://drive.google.com/get_video_info',
             video_id, 'Downloading video webpage', query={'docid': video_id}))
@@ -297,47 +302,76 @@ class GoogleDriveFolderIE(InfoExtractor):
             'title': 'Forrest',
         },
         'playlist_count': 3,
+    }, {
+        # Contains various formats and a subfolder
+        'url': 'https://drive.google.com/drive/folders/1CkqRsNlzZ0o3IL083j17s6sH5Q83DcGo',
+        'info_dict': {
+            'id': '1CkqRsNlzZ0o3IL083j17s6sH5Q83DcGo',
+            'title': r'], sideChannel: {}});',
+        },
+        'playlist_count': 6,
     }]
-    _BOUNDARY = '=====vc17a3rwnndj====='
-    _REQUEST = "/drive/v2beta/files?openDrive=true&reason=102&syncType=0&errorRecovery=false&q=trashed%20%3D%20false%20and%20'{folder_id}'%20in%20parents&fields=kind%2CnextPageToken%2Citems(kind%2CmodifiedDate%2CmodifiedByMeDate%2ClastViewedByMeDate%2CfileSize%2Cowners(kind%2CpermissionId%2Cid)%2ClastModifyingUser(kind%2CpermissionId%2Cid)%2ChasThumbnail%2CthumbnailVersion%2Ctitle%2Cid%2CresourceKey%2Cshared%2CsharedWithMeDate%2CuserPermission(role)%2CexplicitlyTrashed%2CmimeType%2CquotaBytesUsed%2Ccopyable%2CfileExtension%2CsharingUser(kind%2CpermissionId%2Cid)%2Cspaces%2Cversion%2CteamDriveId%2ChasAugmentedPermissions%2CcreatedDate%2CtrashingUser(kind%2CpermissionId%2Cid)%2CtrashedDate%2Cparents(id)%2CshortcutDetails(targetId%2CtargetMimeType%2CtargetLookupStatus)%2Ccapabilities(canCopy%2CcanDownload%2CcanEdit%2CcanAddChildren%2CcanDelete%2CcanRemoveChildren%2CcanShare%2CcanTrash%2CcanRename%2CcanReadTeamDrive%2CcanMoveTeamDriveItem)%2Clabels(starred%2Ctrashed%2Crestricted%2Cviewed))%2CincompleteSearch&appDataFilter=NO_APP_DATA&spaces=drive&pageToken={page_token}&maxResults=50&supportsTeamDrives=true&includeItemsFromAllDrives=true&corpora=default&orderBy=folder%2Ctitle_natural%20asc&retryCount=0&key={key} HTTP/1.1"
-    _DATA = f'''--{_BOUNDARY}
-content-type: application/http
-content-transfer-encoding: binary
+    _JSON_DS_RE = r'key\s*?:\s*?([\'"])ds:\s*?%d\1,[^}]*data:'
+    _JSON_HASH_RE = r'hash\s*?:\s*?([\'"])%d\1,[^}]*data:'
+    _ARRAY_RE = r'\[(?s:.+)\]'
 
-GET %s
+    def _extract_json_ds(self, dsval, webpage, video_id, **kwargs):
+        """
+        Searches for json with the 'ds' value(0~5) from the webpage with regex.
+        Folder info: ds=0; Folder items: ds=4.
+        For example, if the webpage contains the line below, the empty data array
+        can be got by passing dsval=3 to this function.
+            AF_initDataCallback({key: 'ds:3', hash: '2', data:[], sideChannel: {}});
+        """
+        return self._search_json(self._JSON_DS_RE % dsval, webpage,
+                                 f'webpage JSON ds:{dsval}', video_id,
+                                 contains_pattern=self._ARRAY_RE, **kwargs)
 
---{_BOUNDARY}
-'''
-
-    def _call_api(self, folder_id, key, data, **kwargs):
-        response = self._download_webpage(
-            'https://clients6.google.com/batch/drive/v2beta',
-            folder_id, data=data.encode(),
-            headers={
-                'Content-Type': 'text/plain;charset=UTF-8;',
-                'Origin': 'https://drive.google.com',
-            }, query={
-                '$ct': f'multipart/mixed; boundary="{self._BOUNDARY}"',
-                'key': key,
-            }, **kwargs)
-        return self._search_json('', response, 'api response', folder_id, **kwargs) or {}
-
-    def _get_folder_items(self, folder_id, key):
-        page_token = ''
-        while page_token is not None:
-            request = self._REQUEST.format(folder_id=folder_id, page_token=page_token, key=key)
-            page = self._call_api(folder_id, key, self._DATA % request)
-            yield from page['items']
-            page_token = page.get('nextPageToken')
+    def _extract_json_hash(self, hashval, webpage, video_id, **kwargs):
+        """
+        Searches for json with the 'hash' value(1~6) from the webpage with regex.
+        Folder info: hash=1; Folder items: hash=6.
+        For example, if the webpage contains the line below, the empty data array
+        can be got by passing hashval=2 to this function.
+            AF_initDataCallback({key: 'ds:3', hash: '2', data:[], sideChannel: {}});
+        """
+        return self._search_json(self._JSON_HASH_RE % hashval, webpage,
+                                 f'webpage JSON hash:{hashval}', video_id,
+                                 contains_pattern=self._ARRAY_RE, **kwargs)
 
     def _real_extract(self, url):
+        def item_url_getter(item, video_id):
+            available_IEs = [GoogleDriveFolderIE, GoogleDriveIE]
+            if 'application/vnd.google-apps.shortcut' in item:
+                entry_url = traverse_obj(
+                    item, (..., ..., lambda _, v: any(ie.suitable(v) for ie in available_IEs),
+                           {str}, any))
+            else:
+                entry_url = traverse_obj(
+                    item, (lambda _, v: any(ie.suitable(v) for ie in available_IEs),
+                           {str}, any))
+            if not entry_url:
+                return None
+            return self.url_result(entry_url, video_id=video_id, video_title=item[2])
+
         folder_id = self._match_id(url)
+        headers = self.geo_verification_headers()
 
-        webpage = self._download_webpage(url, folder_id)
-        key = self._search_regex(r'"(\w{39})"', webpage, 'key')
+        webpage = self._download_webpage(url, folder_id, headers=headers)
+        json_folder_info = (
+            self._extract_json_ds(0, webpage, folder_id, default=None)
+            or self._extract_json_hash(1, webpage, folder_id)
+        )
+        json_items = (
+            self._extract_json_ds(4, webpage, folder_id, default=None)
+            or self._extract_json_hash(6, webpage, folder_id)
+        )
 
-        folder_info = self._call_api(folder_id, key, self._DATA % f'/drive/v2beta/files/{folder_id} HTTP/1.1', fatal=False)
+        title = json_folder_info[1][2]
+        items = json_items[-1]
+        if not isinstance(items, list):
+            return self.playlist_result([], folder_id, title)
 
-        return self.playlist_from_matches(
-            self._get_folder_items(folder_id, key), folder_id, folder_info.get('title'),
-            ie=GoogleDriveIE, getter=lambda item: f'https://drive.google.com/file/d/{item["id"]}')
+        return self.playlist_result(
+            (entry for item in items if (entry := item_url_getter(item, folder_id))),
+            folder_id, title)
