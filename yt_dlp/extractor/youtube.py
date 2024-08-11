@@ -79,6 +79,7 @@ INNERTUBE_CLIENTS = {
             },
         },
         'INNERTUBE_CONTEXT_CLIENT_NAME': 1,
+        'REQUIRE_PO_TOKEN': True,
     },
     # Safari UA returns pre-merged video+audio 144p/240p/360p/720p/1080p HLS formats
     'web_safari': {
@@ -90,6 +91,7 @@ INNERTUBE_CLIENTS = {
             },
         },
         'INNERTUBE_CONTEXT_CLIENT_NAME': 1,
+        'REQUIRE_PO_TOKEN': True,
     },
     'web_embedded': {
         'INNERTUBE_CONTEXT': {
@@ -132,6 +134,7 @@ INNERTUBE_CLIENTS = {
         },
         'INNERTUBE_CONTEXT_CLIENT_NAME': 3,
         'REQUIRE_JS_PLAYER': False,
+        'REQUIRE_PO_TOKEN': True,
     },
     'android_music': {
         'INNERTUBE_CONTEXT': {
@@ -146,6 +149,7 @@ INNERTUBE_CLIENTS = {
         },
         'INNERTUBE_CONTEXT_CLIENT_NAME': 21,
         'REQUIRE_JS_PLAYER': False,
+        'REQUIRE_PO_TOKEN': True,
     },
     'android_creator': {
         'INNERTUBE_CONTEXT': {
@@ -160,6 +164,7 @@ INNERTUBE_CLIENTS = {
         },
         'INNERTUBE_CONTEXT_CLIENT_NAME': 14,
         'REQUIRE_JS_PLAYER': False,
+        'REQUIRE_PO_TOKEN': True,
     },
     # YouTube Kids videos aren't returned on this client for some reason
     'android_vr': {
@@ -323,6 +328,7 @@ def build_innertube_clients():
     for client, ytcfg in tuple(INNERTUBE_CLIENTS.items()):
         ytcfg.setdefault('INNERTUBE_HOST', 'www.youtube.com')
         ytcfg.setdefault('REQUIRE_JS_PLAYER', True)
+        ytcfg.setdefault('REQUIRE_PO_TOKEN', False)
         ytcfg.setdefault('PLAYER_PARAMS', None)
         ytcfg['INNERTUBE_CONTEXT']['client'].setdefault('hl', 'en')
 
@@ -707,12 +713,13 @@ class YoutubeBaseInfoExtractor(InfoExtractor):
                 # and just "user_syncid||" for primary channel. We only want the channel_syncid
                 return sync_ids[0]
 
-    @staticmethod
-    def _extract_visitor_data(*args):
+    def _extract_visitor_data(self, *args):
         """
         Extracts visitorData from an API response or ytcfg
         Appears to be used to track session state
         """
+        if visitor_data := self._configuration_arg('visitor_data', [None], ie_key=YoutubeIE, casesense=True)[0]:
+            return visitor_data
         return get_first(
             args, [('VISITOR_DATA', ('INNERTUBE_CONTEXT', 'client', 'visitorData'), ('responseContext', 'visitorData'))],
             expected_type=str)
@@ -720,6 +727,52 @@ class YoutubeBaseInfoExtractor(InfoExtractor):
     @functools.cached_property
     def is_authenticated(self):
         return bool(self._generate_sapisidhash_header())
+
+    _PO_TOKEN_CACHE = None
+
+    def _get_cached_po_token(self, client='web', **kwargs):
+        if not self._PO_TOKEN_CACHE:
+            self._PO_TOKEN_CACHE = {}
+
+        if client not in INNERTUBE_CLIENTS:
+            self.report_warning(f'Bad innertube client "{client}"')
+            return None
+
+        # Cache poToken based on base client.
+        # assuming the po token can work across base clients
+        # (e.g. web:web_embedded:web_music:web_creator, android:android_music, ios:ios_music, etc.)
+        base_client = _split_innertube_client(client)[1]
+
+        return self._PO_TOKEN_CACHE.get(base_client)
+
+    def fetch_po_token(self, client='web', visitor_data=None, **kwargs):
+        cached_pot = self._get_cached_po_token(client)
+        if cached_pot:
+            return cached_pot
+
+        if not visitor_data:
+            self.report_warning(
+                f'Unable to fetch PO token for {client} client: Missing required visitor_data. '
+                f'You may need to pass visitor_data with --extractor-args youtube:visitor_data=XXX',
+            )
+            return
+
+        po_token = self._fetch_po_token(visitor_data=visitor_data, client=client)
+        if po_token:
+            self._PO_TOKEN_CACHE[_split_innertube_client(client)[1]] = po_token
+
+        return po_token
+
+    def _fetch_po_token(self, client, visitor_data, **kwargs):
+        po_tokens = self._configuration_arg('po_token', [], ie_key=YoutubeIE, casesense=True)
+        for token_str in po_tokens:
+            if ':' in token_str:
+                po_token_client, po_token = token_str.split(':')
+            else:
+                # if no client specified, use for all clients
+                po_token_client, po_token = client or 'web', token_str
+            if not client or po_token_client == client:
+                return po_token
 
     def extract_ytcfg(self, video_id, webpage):
         if not webpage:
@@ -1335,10 +1388,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
     }
     _SUBTITLE_FORMATS = ('json3', 'srv1', 'srv2', 'srv3', 'ttml', 'vtt')
     _POTOKEN_EXPERIMENTS = ('51217476', '51217102')
-    _BROKEN_CLIENTS = {
-        short_client_name(client): client
-        for client in ('android', 'android_creator', 'android_music')
-    }
+    _BROKEN_CLIENTS = ()
 
     _GEO_BYPASS = False
 
@@ -3720,9 +3770,10 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
 
         session_index = self._extract_session_index(player_ytcfg, master_ytcfg)
         syncid = self._extract_account_syncid(player_ytcfg, master_ytcfg, initial_pr)
+        visitor_data = self._extract_visitor_data(player_ytcfg, master_ytcfg, initial_pr)
         sts = self._extract_signature_timestamp(video_id, player_url, master_ytcfg, fatal=False) if player_url else None
         headers = self.generate_api_headers(
-            ytcfg=player_ytcfg, account_syncid=syncid, session_index=session_index, default_client=client)
+            ytcfg=player_ytcfg, account_syncid=syncid, session_index=session_index, default_client=client, visitor_data=visitor_data)
 
         yt_query = {
             'videoId': video_id,
@@ -3732,6 +3783,9 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
             INNERTUBE_CLIENTS, (_split_innertube_client(client)[0], 'PLAYER_PARAMS', {str}))
         if player_params := self._configuration_arg('player_params', [default_pp], casesense=True)[0]:
             yt_query['params'] = player_params
+
+        if po_token := self.fetch_po_token(client=client, visitor_data=visitor_data):
+            yt_query['serviceIntegrityDimensions'] = {'poToken': po_token}
 
         yt_query.update(self._generate_player_context(sts))
         return self._extract_response(
@@ -3755,7 +3809,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                 requested_clients.extend(allowed_clients)
             elif client not in allowed_clients:
                 self.report_warning(f'Skipping unsupported client {client}')
-            elif client in self._BROKEN_CLIENTS.values():
+            elif client in self._BROKEN_CLIENTS:
                 broken_clients.append(client)
             else:
                 requested_clients.append(client)
@@ -3785,7 +3839,11 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
             if 'web' in clients:
                 experiments = traverse_obj(master_ytcfg, (
                     'WEB_PLAYER_CONTEXT_CONFIGS', ..., 'serializedExperimentIds', {lambda x: x.split(',')}, ...))
-                if all(x in experiments for x in self._POTOKEN_EXPERIMENTS):
+                if (
+                    self._get_default_ytcfg('web').get('REQUIRE_PO_TOKEN')
+                    and not self.fetch_po_token(client='web', visitor_data=self._extract_visitor_data(master_ytcfg))
+                    and all(x in experiments for x in self._POTOKEN_EXPERIMENTS)
+                ):
                     self.report_warning(
                         'Webpage contains broken formats (poToken experiment detected). Ignoring initial player response')
                     ignore_initial_response = True
@@ -3818,10 +3876,8 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
         skipped_clients = {}
         while clients:
             client, base_client, variant = _split_innertube_client(clients.pop())
-            player_ytcfg = {}
-            if client == 'web':
-                player_ytcfg = self._get_default_ytcfg() if ignore_initial_response else master_ytcfg
-            elif 'configs' not in self._configuration_arg('player_skip'):
+            player_ytcfg = master_ytcfg if client == 'web' else {}
+            if 'configs' not in self._configuration_arg('player_skip') and client != 'web':
                 player_ytcfg = self._download_ytcfg(client, video_id) or player_ytcfg
 
             player_url = player_url or self._extract_player_url(master_ytcfg, player_ytcfg, webpage=webpage)
@@ -3846,8 +3902,12 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                 experiments = traverse_obj(pr, (
                     'responseContext', 'serviceTrackingParams', lambda _, v: v['service'] == 'GFEEDBACK',
                     'params', lambda _, v: v['key'] == 'e', 'value', {lambda x: x.split(',')}, ...))
-                if all(x in experiments for x in self._POTOKEN_EXPERIMENTS):
+                if all(x in experiments for x in self._POTOKEN_EXPERIMENTS) and not self._get_cached_po_token(client=client):
                     pr = None
+                    # Generate a new session. Note this will have a new visitor ID and auth may not work correctly.
+                    player_ytcfg = self._get_default_ytcfg(client)
+                    if 'configs' not in self._configuration_arg('player_skip'):
+                        player_ytcfg = self._download_ytcfg(client, video_id) or player_ytcfg
                     retry.error = ExtractorError('API returned broken formats (poToken experiment detected)', expected=True)
             if not pr:
                 continue
@@ -3856,11 +3916,10 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                 skipped_clients[client] = pr_id
             elif pr:
                 # Save client name for introspection later
-                name = short_client_name(client)
                 sd = traverse_obj(pr, ('streamingData', {dict})) or {}
-                sd[STREAMING_DATA_CLIENT_NAME] = name
+                sd[STREAMING_DATA_CLIENT_NAME] = client
                 for f in traverse_obj(sd, (('formats', 'adaptiveFormats'), ..., {dict})):
-                    f[STREAMING_DATA_CLIENT_NAME] = name
+                    f[STREAMING_DATA_CLIENT_NAME] = client
                 prs.append(pr)
 
             # tv_embedded can work around age-gate and age-verification IF the video is embeddable
@@ -4019,12 +4078,20 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                     f'{video_id}: Some formats are possibly damaged. They will be deprioritized', only_once=True)
 
             client_name = fmt.get(STREAMING_DATA_CLIENT_NAME)
-            # _BROKEN_CLIENTS return videoplayback URLs that expire after 30 seconds
+            po_token = self._get_cached_po_token(client=client_name)
+
+            if po_token:
+                fmt_url = update_url_query(fmt_url, {'pot': po_token})
+
+            # Clients that require poToken return videoplayback URLs that expire after 30 seconds if not supplied.
             # Ref: https://github.com/yt-dlp/yt-dlp/issues/9554
-            is_broken = client_name in self._BROKEN_CLIENTS
+            is_broken = (
+                client_name in self._BROKEN_CLIENTS
+                or (not po_token and self._get_default_ytcfg(client_name).get('REQUIRE_PO_TOKEN'))
+            )
             if is_broken:
                 self.report_warning(
-                    f'{video_id}: {self._BROKEN_CLIENTS[client_name]} client formats are broken '
+                    f'{video_id}: {client_name} client formats are broken '
                     'and may yield HTTP Error 403. They will be deprioritized', only_once=True)
 
             name = fmt.get('qualityLabel') or quality.replace('audio_quality_', '') or ''
@@ -4148,7 +4215,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                     hls_manifest_url, video_id, 'mp4', fatal=False, live=live_status == 'is_live')
                 subtitles = self._merge_subtitles(subs, subtitles)
                 for f in fmts:
-                    if process_manifest_format(f, 'hls', client_name, self._search_regex(
+                    if process_manifest_format(f, 'hls', short_client_name(client_name), self._search_regex(
                             r'/itag/(\d+)', f['url'], 'itag', default=None)):
                         yield f
 
@@ -4157,7 +4224,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                 formats, subs = self._extract_mpd_formats_and_subtitles(dash_manifest_url, video_id, fatal=False)
                 subtitles = self._merge_subtitles(subs, subtitles)  # Prioritize HLS subs over DASH
                 for f in formats:
-                    if process_manifest_format(f, 'dash', client_name, f['format_id']):
+                    if process_manifest_format(f, 'dash', short_client_name(client_name), f['format_id']):
                         f['filesize'] = int_or_none(self._search_regex(
                             r'/clen/(\d+)', f.get('fragment_base_url') or f['url'], 'file size', default=None))
                         if needs_live_processing:
