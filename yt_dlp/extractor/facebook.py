@@ -963,6 +963,7 @@ class FacebookAdsIE(InfoExtractor):
             'id': '899206155126718',
             'ext': 'mp4',
             'title': 'video by Kandao',
+            'description': 'md5:0822724069e3aca97cbed5dabbab282e',
             'uploader': 'Kandao',
             'uploader_id': '774114102743284',
             'uploader_url': r're:^https?://.*',
@@ -1017,19 +1018,31 @@ class FacebookAdsIE(InfoExtractor):
         video_id = self._match_id(url)
         webpage = self._download_webpage(url, video_id)
 
-        post_data = [self._parse_json(j, video_id, fatal=False)
-                     for j in re.findall(r's\.handle\(({.*})\);requireLazy\(', webpage)]
-        data = traverse_obj(post_data, (
-            ..., 'require', ..., ..., ..., 'props', 'deeplinkAdCard', 'snapshot', {dict}), get_all=False)
+        if post_data := [self._parse_json(j, video_id, fatal=False)
+                         for j in re.findall(r'data-sjs>({.*?ScheduledServerJS.*?})</script>', webpage)]:
+            data = traverse_obj(post_data, (
+                ..., 'require', ..., ..., ..., '__bbox', 'require', ..., ..., ...,
+                'entryPointRoot', 'otherProps', 'deeplinkAdCard', 'snapshot', {dict}), get_all=False)
+        elif post_data := [self._parse_json(j, video_id, fatal=False)
+                           for j in re.findall(r's\.handle\(({.*})\);requireLazy\(', webpage)]:
+            data = traverse_obj(post_data, (
+                ..., 'require', ..., ..., ..., 'props', 'deeplinkAdCard', 'snapshot', {dict}), get_all=False)
         if not data:
             raise ExtractorError('Unable to extract ad data')
 
         title = data.get('title')
         if not title or title == '{{product.name}}':
             title = join_nonempty('display_format', 'page_name', delim=' by ', from_dict=data)
+        markup = None
+        if markup_id := traverse_obj(data, ('body', '__m', {str_or_none}), get_all=False):
+            markup = clean_html(traverse_obj(post_data, (
+                ..., 'require', ..., ..., ..., '__bbox', 'markup', lambda _, v: v[0].startswith(markup_id),
+                ..., '__html', {lambda x: x if x and not x.startswith('&#123;&#123;product.') else None}),
+                get_all=False))
 
         info_dict = traverse_obj(data, {
-            'description': ('link_description', {str}, {lambda x: x if x != '{{product.description}}' else None}),
+            'title': ({lambda x: title}),
+            'description': ('link_description', {lambda x: markup or (x if x and not x.startswith('{{product.') else None)}),
             'uploader': ('page_name', {str}),
             'uploader_id': ('page_id', {str_or_none}),
             'uploader_url': ('page_profile_uri', {url_or_none}),
@@ -1044,7 +1057,7 @@ class FacebookAdsIE(InfoExtractor):
             entries.append({
                 'id': f'{video_id}_{idx}',
                 'title': entry.get('title') or title,
-                'description': entry.get('link_description') or info_dict.get('description'),
+                'description': entry.get('body') or entry.get('link_description') or info_dict.get('description'),
                 'thumbnail': url_or_none(entry.get('video_preview_image_url')),
                 'formats': self._extract_formats(entry),
             })
